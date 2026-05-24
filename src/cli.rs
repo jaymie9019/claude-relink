@@ -1,4 +1,5 @@
 use crate::paths::{default_claude_dir, default_desktop_dir, default_relink_dir, library_dir};
+use crate::restore::{restore_backup, restore_latest};
 use crate::sync::{apply_sync_plan, build_sync_plan, SyncFilters};
 use anyhow::Result;
 use clap::{ArgGroup, Parser, Subcommand};
@@ -86,7 +87,7 @@ pub struct LibraryCommand {
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sync(command) => sync(command),
-        Command::Restore(_) => Ok(()),
+        Command::Restore(command) => restore(command),
         Command::Library(_) => Ok(()),
     }
 }
@@ -116,6 +117,18 @@ fn sync(command: SyncCommand) -> Result<()> {
     } else {
         print!("{}", crate::report::sync_plan(&plan));
     }
+    Ok(())
+}
+
+fn restore(command: RestoreCommand) -> Result<()> {
+    let summary = if let Some(backup_dir) = command.backup {
+        restore_backup(&backup_dir, command.force_while_running)?
+    } else {
+        let relink_dir = command.relink_dir.unwrap_or(default_relink_dir()?);
+        restore_latest(&relink_dir, command.force_while_running)?
+    };
+
+    print!("{}", crate::report::restore_summary(&summary));
     Ok(())
 }
 

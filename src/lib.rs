@@ -5,6 +5,7 @@ pub mod library;
 pub mod paths;
 pub mod process;
 pub mod report;
+pub mod restore;
 pub mod sync;
 pub mod transcript;
 

@@ -39,3 +39,22 @@ Skipped existing: {}
         summary.skipped_existing.len(),
     )
 }
+
+pub fn restore_summary(summary: &crate::restore::RestoreSummary) -> String {
+    format!(
+        "\
+Restore completed.
+
+Backup:
+{}
+
+Restored bucket:
+{}
+
+Restored files: {}
+",
+        summary.backup_path.display(),
+        summary.restored_bucket.display(),
+        summary.restored_file_count,
+    )
+}

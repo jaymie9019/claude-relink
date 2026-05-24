@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod desktop_index;
+pub mod library;
 pub mod paths;
 pub mod transcript;
 

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct DesktopIndex {
@@ -79,6 +80,45 @@ fn file_stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+pub fn build_index_for_current_account(session: &crate::library::LibrarySession) -> Value {
+    let session_id = format!("local_{}", Uuid::new_v4());
+    let mut object = session
+        .raw_index_template
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    object.insert("sessionId".to_string(), json!(session_id));
+    object.insert("cliSessionId".to_string(), json!(session.cli_session_id));
+    object.insert("cwd".to_string(), json!(session.cwd_string()));
+    object.insert("originCwd".to_string(), json!(session.origin_cwd_string()));
+    object.insert(
+        "createdAt".to_string(),
+        json!(session.created_at_ms.unwrap_or(0)),
+    );
+    object.insert(
+        "lastActivityAt".to_string(),
+        json!(session
+            .last_activity_at_ms
+            .unwrap_or(session.created_at_ms.unwrap_or(0))),
+    );
+    object.insert(
+        "lastFocusedAt".to_string(),
+        json!(session.last_focused_at_ms.unwrap_or(
+            session
+                .last_activity_at_ms
+                .unwrap_or(session.created_at_ms.unwrap_or(0))
+        )),
+    );
+    object.insert("title".to_string(), json!(session.title_or_fallback()));
+    object.insert("isArchived".to_string(), json!(false));
+    object
+        .entry("titleSource".to_string())
+        .or_insert_with(|| json!("auto"));
+
+    Value::Object(object)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +191,77 @@ mod tests {
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].session_id, "local_valid");
         assert_eq!(indexes[0].cli_session_id.as_deref(), Some("cli-valid"));
+    }
+
+    #[test]
+    fn build_index_for_current_account_creates_new_local_session_id_and_preserves_cli_session_id() {
+        let session = crate::library::LibrarySession {
+            cli_session_id: "cli-original".to_string(),
+            transcript_path: None,
+            cwd: Some(PathBuf::from("/project/current")),
+            origin_cwd: Some(PathBuf::from("/project/origin")),
+            title: Some("Visible session".to_string()),
+            created_at_ms: Some(1000),
+            last_activity_at_ms: Some(2000),
+            last_focused_at_ms: Some(3000),
+            completed_turns: Some(12),
+            source_indexes: Vec::new(),
+            raw_index_template: serde_json::json!({
+                "sessionId": "local_old",
+                "cliSessionId": "cli-old",
+                "cwd": "/project/old",
+                "originCwd": "/project/old-origin",
+                "createdAt": 1,
+                "lastActivityAt": 2,
+                "lastFocusedAt": 3,
+                "title": "Old title",
+                "titleSource": "manual",
+                "isArchived": true,
+                "permissionMode": "bypassPermissions"
+            }),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let rebuilt = build_index_for_current_account(&session);
+
+        let session_id = rebuilt["sessionId"].as_str().unwrap();
+        assert!(session_id.starts_with("local_"));
+        assert_ne!(session_id, "local_old");
+        assert_eq!(rebuilt["cliSessionId"], "cli-original");
+        assert_eq!(rebuilt["cwd"], "/project/current");
+        assert_eq!(rebuilt["originCwd"], "/project/origin");
+        assert_eq!(rebuilt["createdAt"], 1000);
+        assert_eq!(rebuilt["lastActivityAt"], 2000);
+        assert_eq!(rebuilt["lastFocusedAt"], 3000);
+        assert_eq!(rebuilt["title"], "Visible session");
+        assert_eq!(rebuilt["titleSource"], "manual");
+        assert_eq!(rebuilt["isArchived"], false);
+        assert_eq!(rebuilt["permissionMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn build_index_for_current_account_fills_title_source_when_missing() {
+        let session = crate::library::LibrarySession {
+            cli_session_id: "cli-title-source".to_string(),
+            transcript_path: None,
+            cwd: None,
+            origin_cwd: None,
+            title: None,
+            created_at_ms: None,
+            last_activity_at_ms: None,
+            last_focused_at_ms: None,
+            completed_turns: None,
+            source_indexes: Vec::new(),
+            raw_index_template: serde_json::json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let rebuilt = build_index_for_current_account(&session);
+
+        assert_eq!(rebuilt["titleSource"], "auto");
+        assert_eq!(rebuilt["title"], "Recovered cli-titl");
+        assert_eq!(rebuilt["createdAt"], 0);
+        assert_eq!(rebuilt["lastActivityAt"], 0);
+        assert_eq!(rebuilt["lastFocusedAt"], 0);
     }
 }

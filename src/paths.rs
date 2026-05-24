@@ -43,7 +43,7 @@ pub fn desktop_sessions_root(desktop_dir: &Path) -> PathBuf {
 
 pub fn read_owner_account_id(desktop_dir: &Path) -> Result<Option<String>> {
     let config_path = desktop_dir.join("cowork-enabled-cli-ops.json");
-    if !config_path.exists() {
+    if !path_try_exists(&config_path)? {
         return Ok(None);
     }
 
@@ -60,7 +60,7 @@ pub fn read_owner_account_id(desktop_dir: &Path) -> Result<Option<String>> {
 
 pub fn list_desktop_buckets(desktop_dir: &Path) -> Result<Vec<DesktopBucket>> {
     let root = desktop_sessions_root(desktop_dir);
-    if !root.exists() {
+    if !path_try_exists(&root)? {
         return Ok(Vec::new());
     }
 
@@ -145,7 +145,9 @@ pub fn resolve_target_bucket(
 
         match owner_buckets.as_slice() {
             [bucket] => return Ok((*bucket).clone()),
-            [] => {}
+            [] => bail!(
+                "owner account {owner_account_id} has no Claude Desktop bucket; pass --account-id and --org-id to choose a target, or log in to Claude Desktop and create the current account bucket"
+            ),
             _ => bail!(
                 "owner account {owner_account_id} has multiple organization buckets; pass --account-id and --org-id"
             ),
@@ -157,6 +159,11 @@ pub fn resolve_target_bucket(
     }
 
     bail!("multiple Desktop buckets found; pass --account-id and --org-id")
+}
+
+fn path_try_exists(path: &Path) -> Result<bool> {
+    path.try_exists()
+        .with_context(|| format!("failed to inspect {}", path.display()))
 }
 
 fn count_local_indexes(bucket_path: &Path) -> Result<usize> {
@@ -223,6 +230,24 @@ mod tests {
     }
 
     #[test]
+    fn stale_owner_account_does_not_fall_back_to_only_bucket() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("cowork-enabled-cli-ops.json"),
+            r#"{"ownerAccountId":"current"}"#,
+        )
+        .unwrap();
+        create_bucket(temp.path(), "old", "org");
+
+        let error = resolve_target_bucket(temp.path(), None, None).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("owner account current"));
+        assert!(message.contains("--account-id"));
+        assert!(message.contains("--org-id"));
+    }
+
+    #[test]
     fn explicit_pair_selects_exact_bucket() {
         let temp = tempdir().unwrap();
         create_bucket(temp.path(), "current", "org");
@@ -255,6 +280,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("pass both --account-id and --org-id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_config_metadata_errors_are_not_treated_as_missing() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("cowork-enabled-cli-ops.json");
+        std::os::unix::fs::symlink(&config_path, &config_path).unwrap();
+
+        let error = read_owner_account_id(temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("failed to inspect"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessions_root_metadata_errors_are_not_treated_as_missing() {
+        let temp = tempdir().unwrap();
+        let root = desktop_sessions_root(temp.path());
+        std::os::unix::fs::symlink(&root, &root).unwrap();
+
+        let error = list_desktop_buckets(temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("failed to inspect"));
     }
 
     #[test]

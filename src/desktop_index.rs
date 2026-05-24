@@ -43,8 +43,10 @@ pub fn scan_desktop_indexes(bucket: &Path) -> Result<Vec<DesktopIndex>> {
         let path = entry.path();
         let raw_text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let raw: Value = serde_json::from_str(&raw_text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let raw: Value = match serde_json::from_str(&raw_text) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
         let session_id = raw
             .get("sessionId")
             .and_then(Value::as_str)
@@ -132,5 +134,22 @@ mod tests {
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].session_id, "local_fallback");
         assert_eq!(indexes[0].cli_session_id.as_deref(), Some("cli-fallback"));
+    }
+
+    #[test]
+    fn scan_desktop_indexes_skips_malformed_local_json() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("local_valid.json"),
+            r#"{"sessionId":"local_valid","cliSessionId":"cli-valid"}"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("local_malformed.json"), "{").unwrap();
+
+        let indexes = scan_desktop_indexes(temp.path()).unwrap();
+
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].session_id, "local_valid");
+        assert_eq!(indexes[0].cli_session_id.as_deref(), Some("cli-valid"));
     }
 }

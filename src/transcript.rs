@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -17,9 +18,21 @@ pub fn scan_transcripts(claude_dir: &Path) -> Result<Vec<TranscriptRef>> {
         return Ok(Vec::new());
     }
 
+    fs::read_dir(&projects_dir)
+        .with_context(|| format!("failed to read {}", projects_dir.display()))?;
+
     let mut transcripts = Vec::new();
     for entry in WalkDir::new(&projects_dir) {
-        let entry = entry.with_context(|| format!("failed to walk {}", projects_dir.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error.depth() == 0 {
+                    return Err(error)
+                        .with_context(|| format!("failed to walk {}", projects_dir.display()));
+                }
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -80,5 +93,31 @@ mod tests {
         let transcripts = scan_transcripts(temp.path()).unwrap();
 
         assert!(transcripts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_transcripts_skips_unreadable_walk_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        let readable = projects.join("-tmp-readable");
+        let unreadable = projects.join("-tmp-unreadable");
+        fs::create_dir_all(&readable).unwrap();
+        fs::create_dir_all(&unreadable).unwrap();
+        fs::write(readable.join("session-readable.jsonl"), "{}").unwrap();
+        fs::write(unreadable.join("session-hidden.jsonl"), "{}").unwrap();
+
+        let original_permissions = fs::metadata(&unreadable).unwrap().permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = scan_transcripts(temp.path());
+
+        fs::set_permissions(&unreadable, original_permissions).unwrap();
+        let transcripts = result.unwrap();
+
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].cli_session_id, "session-readable");
     }
 }

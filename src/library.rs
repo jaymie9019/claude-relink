@@ -57,6 +57,7 @@ impl LibrarySession {
     pub fn title_or_fallback(&self) -> String {
         self.title
             .as_deref()
+            .map(str::trim)
             .filter(|title| !title.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
@@ -81,12 +82,15 @@ pub fn refresh_library(
         .map(|transcript| (transcript.cli_session_id.clone(), transcript.path.clone()))
         .collect();
     let mut by_id: BTreeMap<String, LibrarySession> = BTreeMap::new();
+    let mut title_activity_by_id: BTreeMap<String, i64> = BTreeMap::new();
 
     for (bucket, indexes) in bucket_indexes {
         for index in indexes {
             let Some(cli_session_id) = index.cli_session_id.clone() else {
                 continue;
             };
+            let index_activity_key = index_activity_key(index);
+            let index_title = title_field(&index.raw);
 
             let candidate = session_from_index(
                 cli_session_id.clone(),
@@ -96,13 +100,18 @@ pub fn refresh_library(
             );
 
             let entry = by_id.entry(cli_session_id).or_insert(candidate);
-            if latest_activity_key(
-                index.raw.get("lastActivityAt"),
-                index.raw.get("lastFocusedAt"),
-                index.raw.get("createdAt"),
-            ) > session_activity_key(entry)
-            {
+            if index_activity_key > session_activity_key(entry) {
                 update_session_from_index(entry, index);
+            }
+            if let Some(title) = index_title {
+                let current_title_activity = title_activity_by_id
+                    .get(&entry.cli_session_id)
+                    .copied()
+                    .unwrap_or(i64::MIN);
+                if index_activity_key > current_title_activity {
+                    entry.title = Some(title);
+                    title_activity_by_id.insert(entry.cli_session_id.clone(), index_activity_key);
+                }
             }
             if entry.transcript_path.is_none() {
                 entry.transcript_path = transcript_by_id.get(&entry.cli_session_id).cloned();
@@ -201,7 +210,7 @@ fn session_from_index(
         transcript_path,
         cwd: index.cwd.clone(),
         origin_cwd: index.origin_cwd.clone(),
-        title: string_field(&index.raw, "title"),
+        title: title_field(&index.raw),
         created_at_ms: i64_field(&index.raw, "createdAt"),
         last_activity_at_ms: i64_field(&index.raw, "lastActivityAt"),
         last_focused_at_ms: i64_field(&index.raw, "lastFocusedAt"),
@@ -219,7 +228,6 @@ fn session_from_index(
 fn update_session_from_index(session: &mut LibrarySession, index: &DesktopIndex) {
     session.cwd = index.cwd.clone();
     session.origin_cwd = index.origin_cwd.clone();
-    session.title = string_field(&index.raw, "title");
     session.created_at_ms = i64_field(&index.raw, "createdAt");
     session.last_activity_at_ms = i64_field(&index.raw, "lastActivityAt");
     session.last_focused_at_ms = i64_field(&index.raw, "lastFocusedAt");
@@ -239,6 +247,14 @@ fn session_activity_key(session: &LibrarySession) -> i64 {
         .unwrap_or(i64::MIN)
 }
 
+fn index_activity_key(index: &DesktopIndex) -> i64 {
+    latest_activity_key(
+        index.raw.get("lastActivityAt"),
+        index.raw.get("lastFocusedAt"),
+        index.raw.get("createdAt"),
+    )
+}
+
 fn latest_activity_key(
     last_activity_at: Option<&Value>,
     last_focused_at: Option<&Value>,
@@ -255,10 +271,12 @@ fn i64_field(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
 
-fn string_field(value: &Value, key: &str) -> Option<String> {
+fn title_field(value: &Value) -> Option<String> {
     value
-        .get(key)
+        .get("title")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
         .map(ToOwned::to_owned)
 }
 
@@ -475,6 +493,69 @@ mod tests {
         assert_eq!(session.last_focused_at_ms, Some(400));
         assert_eq!(session.completed_turns, Some(9));
         assert_eq!(session.raw_index_template["permissionMode"], "acceptEdits");
+    }
+
+    #[test]
+    fn refresh_library_preserves_latest_nonempty_title_when_newer_index_title_is_missing_or_blank()
+    {
+        for (case, newer_title) in [("missing", None), ("blank", Some(json!("   \t")))] {
+            let temp = tempdir().unwrap();
+            let older_bucket = bucket(temp.path(), &format!("older-{case}"), "org");
+            let newer_bucket = bucket(temp.path(), &format!("newer-{case}"), "org");
+            let cli_session_id = format!("session-title-{case}");
+            let mut newer_raw = json!({
+                "sessionId": format!("local_newer_{case}"),
+                "cliSessionId": cli_session_id,
+                "cwd": format!("/project/newer-{case}"),
+                "createdAt": 150,
+                "lastActivityAt": 200,
+                "lastFocusedAt": 190,
+                "completedTurns": 7,
+                "permissionMode": "acceptEdits"
+            });
+            if let Some(title) = newer_title {
+                newer_raw["title"] = title;
+            }
+            let indexes = vec![
+                (
+                    older_bucket,
+                    vec![index(
+                        temp.path().join(format!("older-{case}/local_older.json")),
+                        Some(&format!("session-title-{case}")),
+                        json!({
+                            "sessionId": format!("local_older_{case}"),
+                            "cliSessionId": format!("session-title-{case}"),
+                            "cwd": format!("/project/older-{case}"),
+                            "createdAt": 50,
+                            "lastActivityAt": 100,
+                            "title": "Good title",
+                            "completedTurns": 3,
+                            "permissionMode": "bypassPermissions"
+                        }),
+                    )],
+                ),
+                (
+                    newer_bucket,
+                    vec![index(
+                        temp.path().join(format!("newer-{case}/local_newer.json")),
+                        Some(&format!("session-title-{case}")),
+                        newer_raw,
+                    )],
+                ),
+            ];
+
+            let sessions = refresh_library(temp.path(), &indexes, &[]).unwrap();
+
+            let session = &sessions[0];
+            assert_eq!(session.title.as_deref(), Some("Good title"));
+            assert_eq!(session.last_activity_at_ms, Some(200));
+            assert_eq!(session.completed_turns, Some(7));
+            assert_eq!(session.raw_index_template["permissionMode"], "acceptEdits");
+            assert_eq!(
+                session.cwd.as_deref(),
+                Some(Path::new(&format!("/project/newer-{case}")))
+            );
+        }
     }
 
     #[test]

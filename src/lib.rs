@@ -1,5 +1,7 @@
 pub mod cli;
+pub mod desktop_index;
 pub mod paths;
+pub mod transcript;
 
 use anyhow::Result;
 

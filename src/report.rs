@@ -1,4 +1,4 @@
-use crate::sync::SyncPlan;
+use crate::sync::{ApplySummary, SyncPlan};
 
 pub fn sync_plan(plan: &SyncPlan) -> String {
     format!(
@@ -20,5 +20,22 @@ Next:
         plan.already_visible.len(),
         plan.missing.len(),
         plan.skipped_missing_transcript.len(),
+    )
+}
+
+pub fn apply_summary(summary: &ApplySummary) -> String {
+    format!(
+        "\
+Sync applied.
+
+Backup:
+{}
+
+Created files: {}
+Skipped existing: {}
+",
+        summary.backup_path.display(),
+        summary.created_files.len(),
+        summary.skipped_existing.len(),
     )
 }

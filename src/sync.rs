@@ -1,11 +1,18 @@
-use crate::desktop_index::{scan_desktop_indexes, DesktopIndex};
+use crate::backup::{create_sync_backup, write_sync_manifest};
+use crate::desktop_index::{build_index_for_current_account, scan_desktop_indexes, DesktopIndex};
 use crate::library::{refresh_library, LibrarySession};
 use crate::paths::{list_desktop_buckets, resolve_target_bucket, DesktopBucket};
+use crate::process::is_claude_desktop_running;
 use crate::transcript::scan_transcripts;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+const CLAUDE_DESKTOP_RUNNING_MESSAGE: &str = "Claude Desktop appears to be running.
+Quit Claude Desktop fully before applying sync.
+Use --force-while-running only if you know what you are doing.";
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncFilters {
@@ -21,6 +28,13 @@ pub struct SyncPlan {
     pub already_visible: Vec<DesktopIndex>,
     pub missing: Vec<LibrarySession>,
     pub skipped_missing_transcript: Vec<LibrarySession>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplySummary {
+    pub backup_path: PathBuf,
+    pub created_files: Vec<PathBuf>,
+    pub skipped_existing: Vec<String>,
 }
 
 pub fn build_sync_plan(
@@ -96,6 +110,140 @@ pub fn build_sync_plan(
         missing,
         skipped_missing_transcript,
     })
+}
+
+pub fn apply_sync_plan(
+    plan: &SyncPlan,
+    relink_dir: &Path,
+    force_while_running: bool,
+) -> Result<ApplySummary> {
+    if !force_while_running && is_claude_desktop_running()? {
+        bail!(CLAUDE_DESKTOP_RUNNING_MESSAGE);
+    }
+
+    verify_apply_preconditions(plan)?;
+
+    let backup = create_sync_backup(relink_dir, &plan.target_bucket)?;
+    write_sync_manifest(&backup, &[], &[])?;
+
+    let target_indexes = scan_desktop_indexes(&plan.target_bucket.path)?;
+    let mut current_cli_ids = target_indexes
+        .iter()
+        .filter_map(|index| index.cli_session_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut created_files = Vec::new();
+    let mut created_file_names = Vec::new();
+    let mut skipped_existing = Vec::new();
+    for session in &plan.missing {
+        if current_cli_ids.contains(&session.cli_session_id) {
+            skipped_existing.push(session.cli_session_id.clone());
+            continue;
+        }
+
+        verify_session_transcript_exists(session)?;
+        let rebuilt = build_index_for_current_account(session);
+        let written = atomic_write_json(&plan.target_bucket.path, &rebuilt)?;
+        let file_name = written
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .context("created file path has no filename")?;
+        created_file_names.push(file_name);
+        created_files.push(written);
+        current_cli_ids.insert(session.cli_session_id.clone());
+    }
+
+    write_sync_manifest(&backup, &created_file_names, &skipped_existing)?;
+
+    Ok(ApplySummary {
+        backup_path: backup.root_path,
+        created_files,
+        skipped_existing,
+    })
+}
+
+fn verify_apply_preconditions(plan: &SyncPlan) -> Result<()> {
+    if !plan
+        .target_bucket
+        .path
+        .try_exists()
+        .with_context(|| format!("failed to inspect {}", plan.target_bucket.path.display()))?
+    {
+        bail!(
+            "target Desktop bucket does not exist: {}",
+            plan.target_bucket.path.display()
+        );
+    }
+
+    for session in &plan.missing {
+        verify_session_transcript_exists(session)?;
+    }
+
+    Ok(())
+}
+
+fn verify_session_transcript_exists(session: &LibrarySession) -> Result<()> {
+    let transcript_path = session
+        .transcript_path
+        .as_ref()
+        .with_context(|| format!("session {} has no transcript path", session.cli_session_id))?;
+    if !transcript_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect transcript {}", transcript_path.display()))?
+    {
+        bail!(
+            "transcript is missing for session {}: {}",
+            session.cli_session_id,
+            transcript_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn atomic_write_json(bucket: &Path, value: &serde_json::Value) -> Result<PathBuf> {
+    let session_id = value
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .context("Desktop index is missing string sessionId")?;
+    let file_name = format!("{session_id}.json");
+    let final_path = bucket.join(&file_name);
+    if final_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect {}", final_path.display()))?
+    {
+        bail!("target index already exists: {}", final_path.display());
+    }
+
+    let temp_path = bucket.join(format!(".{file_name}.tmp"));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        serde_json::to_writer(&mut file, value)
+            .with_context(|| format!("failed to serialize {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, &final_path).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result?;
+    Ok(final_path)
 }
 
 #[derive(Debug)]
@@ -523,5 +671,82 @@ mod tests {
 
         assert_eq!(session_ids(&plan.missing), vec!["a"]);
         assert!(desktop_cli_ids(&plan.already_visible).is_empty());
+    }
+
+    #[test]
+    fn atomic_write_json_uses_session_id_filename_and_removes_temp_file() {
+        let temp = tempdir().unwrap();
+        let value = json!({
+            "sessionId": "local_atomic",
+            "cliSessionId": "cli-atomic"
+        });
+
+        let written = atomic_write_json(temp.path(), &value).unwrap();
+
+        assert_eq!(written, temp.path().join("local_atomic.json"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("local_atomic.json")).unwrap(),
+            "{\"cliSessionId\":\"cli-atomic\",\"sessionId\":\"local_atomic\"}"
+        );
+        assert!(!temp.path().join(".local_atomic.json.tmp").exists());
+    }
+
+    #[test]
+    fn apply_sync_plan_skips_session_that_became_visible_after_plan_was_built() {
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        let desktop_dir = temp.path().join("desktop");
+        let relink_dir = temp.path().join("relink");
+        let current_bucket = create_bucket(&desktop_dir, "current", "org");
+        write_transcript(&claude_dir, "a");
+        write_index(
+            &current_bucket,
+            "local_current_a",
+            "a",
+            "/Users/demo/project",
+            "/Users/demo/project",
+        );
+        let session = LibrarySession {
+            cli_session_id: "a".to_string(),
+            transcript_path: Some(claude_dir.join("projects/-Users-demo-project/a.jsonl")),
+            cwd: Some(PathBuf::from("/Users/demo/project")),
+            origin_cwd: Some(PathBuf::from("/Users/demo/project")),
+            title: Some("Already visible".to_string()),
+            created_at_ms: Some(1000),
+            last_activity_at_ms: Some(2000),
+            last_focused_at_ms: Some(3000),
+            completed_turns: None,
+            source_indexes: Vec::new(),
+            raw_index_template: json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+        let plan = SyncPlan {
+            target_bucket: DesktopBucket {
+                account_id: "current".to_string(),
+                org_id: "org".to_string(),
+                path: current_bucket.clone(),
+                local_index_count: 1,
+            },
+            library_sessions: vec![session.clone()],
+            already_visible: Vec::new(),
+            missing: vec![session],
+            skipped_missing_transcript: Vec::new(),
+        };
+
+        let summary = apply_sync_plan(&plan, &relink_dir, true).unwrap();
+
+        assert!(summary.created_files.is_empty());
+        assert_eq!(summary.skipped_existing, vec!["a"]);
+        assert_eq!(
+            scan_desktop_indexes(&current_bucket).unwrap().len(),
+            1,
+            "apply must not create a duplicate current-account index"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(summary.backup_path.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest["createdFiles"].as_array().unwrap().is_empty());
+        assert_eq!(manifest["skippedExisting"][0], "a");
     }
 }

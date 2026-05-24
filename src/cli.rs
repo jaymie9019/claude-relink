@@ -1,6 +1,6 @@
 use crate::paths::{default_claude_dir, default_desktop_dir, default_relink_dir, library_dir};
-use crate::sync::{build_sync_plan, SyncFilters};
-use anyhow::{bail, Result};
+use crate::sync::{apply_sync_plan, build_sync_plan, SyncFilters};
+use anyhow::Result;
 use clap::{ArgGroup, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -92,10 +92,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 }
 
 fn sync(command: SyncCommand) -> Result<()> {
-    if command.apply {
-        bail!("sync --apply is not implemented yet");
-    }
-
     let claude_dir = command.paths.claude_dir.unwrap_or(default_claude_dir()?);
     let desktop_dir = command.paths.desktop_dir.unwrap_or(default_desktop_dir()?);
     let relink_dir = command.paths.relink_dir.unwrap_or(default_relink_dir()?);
@@ -114,7 +110,12 @@ fn sync(command: SyncCommand) -> Result<()> {
         filters,
     )?;
 
-    print!("{}", crate::report::sync_plan(&plan));
+    if command.apply {
+        let summary = apply_sync_plan(&plan, &relink_dir, command.force_while_running)?;
+        print!("{}", crate::report::apply_summary(&summary));
+    } else {
+        print!("{}", crate::report::sync_plan(&plan));
+    }
     Ok(())
 }
 

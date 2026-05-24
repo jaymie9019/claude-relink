@@ -1,4 +1,6 @@
-use anyhow::Result;
+use crate::paths::{default_claude_dir, default_desktop_dir, default_relink_dir, library_dir};
+use crate::sync::{build_sync_plan, SyncFilters};
+use anyhow::{bail, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -83,10 +85,37 @@ pub struct LibraryCommand {
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Sync(_) => Ok(()),
+        Command::Sync(command) => sync(command),
         Command::Restore(_) => Ok(()),
         Command::Library(_) => Ok(()),
     }
+}
+
+fn sync(command: SyncCommand) -> Result<()> {
+    if command.apply {
+        bail!("sync --apply is not implemented yet");
+    }
+
+    let claude_dir = command.paths.claude_dir.unwrap_or(default_claude_dir()?);
+    let desktop_dir = command.paths.desktop_dir.unwrap_or(default_desktop_dir()?);
+    let relink_dir = command.paths.relink_dir.unwrap_or(default_relink_dir()?);
+    let library_dir = library_dir(&relink_dir);
+    let filters = SyncFilters {
+        project: command.project,
+        from_account: command.from_account,
+        from_org: command.from_org,
+    };
+    let plan = build_sync_plan(
+        &claude_dir,
+        &desktop_dir,
+        &library_dir,
+        command.paths.account_id.as_deref(),
+        command.paths.org_id.as_deref(),
+        filters,
+    )?;
+
+    print!("{}", crate::report::sync_plan(&plan));
+    Ok(())
 }
 
 #[cfg(test)]

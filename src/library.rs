@@ -104,11 +104,11 @@ pub fn refresh_library(
                 update_session_from_index(entry, index);
             }
             if let Some(title) = index_title {
-                let current_title_activity = title_activity_by_id
+                let should_update_title = title_activity_by_id
                     .get(&entry.cli_session_id)
-                    .copied()
-                    .unwrap_or(i64::MIN);
-                if index_activity_key > current_title_activity {
+                    .map(|current_title_activity| index_activity_key > *current_title_activity)
+                    .unwrap_or(true);
+                if should_update_title {
                     entry.title = Some(title);
                     title_activity_by_id.insert(entry.cli_session_id.clone(), index_activity_key);
                 }
@@ -435,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn read_sessions_accepts_legacy_ms_time_field_names() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            sessions_path(temp.path()),
+            r#"{"cliSessionId":"legacy-time-fields","transcriptPath":null,"cwd":null,"originCwd":null,"title":null,"createdAtMs":11,"lastActivityAtMs":22,"lastFocusedAtMs":33,"completedTurns":null,"sourceIndexes":[],"rawIndexTemplate":{},"updatedAt":"2026-05-24T15:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let sessions = read_sessions(temp.path()).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].created_at_ms, Some(11));
+        assert_eq!(sessions[0].last_activity_at_ms, Some(22));
+        assert_eq!(sessions[0].last_focused_at_ms, Some(33));
+    }
+
+    #[test]
     fn refresh_library_uses_latest_source_index_for_session_fields() {
         let temp = tempdir().unwrap();
         let older_bucket = bucket(temp.path(), "older-account", "org");
@@ -555,6 +573,51 @@ mod tests {
                 session.cwd.as_deref(),
                 Some(Path::new(&format!("/project/newer-{case}")))
             );
+        }
+    }
+
+    #[test]
+    fn refresh_library_selects_first_valid_untimed_title_after_missing_or_blank_title() {
+        for (case, first_title) in [("missing", None), ("blank", Some(json!("   \n")))] {
+            let temp = tempdir().unwrap();
+            let first_bucket = bucket(temp.path(), &format!("first-{case}"), "org");
+            let second_bucket = bucket(temp.path(), &format!("second-{case}"), "org");
+            let cli_session_id = format!("session-untimed-title-{case}");
+            let mut first_raw = json!({
+                "sessionId": format!("local_first_{case}"),
+                "cliSessionId": cli_session_id,
+                "cwd": format!("/project/first-{case}")
+            });
+            if let Some(title) = first_title {
+                first_raw["title"] = title;
+            }
+            let indexes = vec![
+                (
+                    first_bucket,
+                    vec![index(
+                        temp.path().join(format!("first-{case}/local_first.json")),
+                        Some(&format!("session-untimed-title-{case}")),
+                        first_raw,
+                    )],
+                ),
+                (
+                    second_bucket,
+                    vec![index(
+                        temp.path().join(format!("second-{case}/local_second.json")),
+                        Some(&format!("session-untimed-title-{case}")),
+                        json!({
+                            "sessionId": format!("local_second_{case}"),
+                            "cliSessionId": format!("session-untimed-title-{case}"),
+                            "cwd": format!("/project/second-{case}"),
+                            "title": "Untimed title"
+                        }),
+                    )],
+                ),
+            ];
+
+            let sessions = refresh_library(temp.path(), &indexes, &[]).unwrap();
+
+            assert_eq!(sessions[0].title.as_deref(), Some("Untimed title"));
         }
     }
 

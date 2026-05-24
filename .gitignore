@@ -1,0 +1,9 @@
+/target/
+/.claude-session-repair-test/
+*.log
+
+# Local planning and review artifacts. These are useful while collaborating,
+# but should not be published with the CLI repo.
+/docs/superpowers/plans/
+/outputs/
+/docs/research/*.html

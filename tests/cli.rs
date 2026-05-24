@@ -300,6 +300,90 @@ fn restore_backup_replaces_current_bucket_from_explicit_backup_path() {
     assert_eq!(local_files, vec!["local_existing.json"]);
 }
 
+#[test]
+fn library_inspect_prints_counts_after_sync_preview() {
+    let temp = tempdir().unwrap();
+    let claude_dir = temp.path().join(".claude");
+    let desktop_dir = temp.path().join("Library/Application Support/Claude");
+    let relink_dir = temp.path().join(".claude-relink");
+    seed_sync_apply_fixture(&claude_dir, &desktop_dir);
+
+    Command::cargo_bin("claude-relink")
+        .unwrap()
+        .args([
+            "sync",
+            "--claude-dir",
+            claude_dir.to_str().unwrap(),
+            "--desktop-dir",
+            desktop_dir.to_str().unwrap(),
+            "--relink-dir",
+            relink_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("claude-relink")
+        .unwrap()
+        .args([
+            "library",
+            "--relink-dir",
+            relink_dir.to_str().unwrap(),
+            "inspect",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Library: {}",
+            relink_dir.join("library").display()
+        )))
+        .stdout(predicate::str::contains("Sessions: 1"))
+        .stdout(predicate::str::contains("Projects: 1"))
+        .stdout(predicate::str::contains("Source buckets: 1"))
+        .stdout(predicate::str::contains("Missing transcript records: 0"))
+        .stdout(predicate::str::contains("Last refresh: "));
+}
+
+#[test]
+fn library_rebuild_recreates_sessions_jsonl_without_changing_desktop_bucket_files() {
+    let temp = tempdir().unwrap();
+    let claude_dir = temp.path().join(".claude");
+    let desktop_dir = temp.path().join("Library/Application Support/Claude");
+    let relink_dir = temp.path().join(".claude-relink");
+    let current_bucket = seed_sync_apply_fixture(&claude_dir, &desktop_dir);
+    let old_bucket = desktop_dir.join("claude-code-sessions/old/org");
+
+    let before_current_count = count_local_indexes(&current_bucket);
+    let before_old_count = count_local_indexes(&old_bucket);
+    let old_index = old_bucket.join("local_old_a.json");
+    let old_index_before = fs::read_to_string(&old_index).unwrap();
+    fs::create_dir_all(relink_dir.join("library")).unwrap();
+    fs::write(relink_dir.join("library/sessions.jsonl"), "stale\n").unwrap();
+
+    Command::cargo_bin("claude-relink")
+        .unwrap()
+        .args([
+            "library",
+            "--claude-dir",
+            claude_dir.to_str().unwrap(),
+            "--desktop-dir",
+            desktop_dir.to_str().unwrap(),
+            "--relink-dir",
+            relink_dir.to_str().unwrap(),
+            "rebuild",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Library rebuilt. Sessions: 1"));
+
+    let sessions_path = relink_dir.join("library/sessions.jsonl");
+    let sessions_text = fs::read_to_string(sessions_path).unwrap();
+    assert!(sessions_text.contains("\"cliSessionId\":\"a\""));
+    assert!(!sessions_text.contains("stale"));
+    assert_eq!(count_local_indexes(&current_bucket), before_current_count);
+    assert_eq!(count_local_indexes(&old_bucket), before_old_count);
+    assert_eq!(fs::read_to_string(old_index).unwrap(), old_index_before);
+}
+
 fn seed_sync_apply_fixture(claude_dir: &Path, desktop_dir: &Path) -> std::path::PathBuf {
     let project_dir = Path::new("/Users/demo/project");
     let transcript_dir = claude_dir.join("projects/-Users-demo-project");
@@ -340,4 +424,15 @@ fn seed_sync_apply_fixture(claude_dir: &Path, desktop_dir: &Path) -> std::path::
     .unwrap();
 
     current_bucket
+}
+
+fn count_local_indexes(bucket: &Path) -> usize {
+    fs::read_dir(bucket)
+        .unwrap()
+        .filter(|entry| {
+            let name = entry.as_ref().unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("local_") && name.ends_with(".json")
+        })
+        .count()
 }

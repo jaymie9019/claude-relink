@@ -1,11 +1,11 @@
-use crate::desktop_index::DesktopIndex;
-use crate::paths::DesktopBucket;
-use crate::transcript::TranscriptRef;
+use crate::desktop_index::{scan_desktop_indexes, DesktopIndex};
+use crate::paths::{list_desktop_buckets, DesktopBucket};
+use crate::transcript::{scan_transcripts, TranscriptRef};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,16 @@ impl LibrarySession {
                 format!("Recovered {prefix}")
             })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryInspect {
+    pub library_dir: PathBuf,
+    pub sessions: usize,
+    pub projects: usize,
+    pub source_buckets: usize,
+    pub missing_transcript_records: usize,
+    pub last_refresh: Option<DateTime<Utc>>,
 }
 
 pub fn sessions_path(library_dir: &Path) -> PathBuf {
@@ -197,6 +207,76 @@ pub fn read_sessions(library_dir: &Path) -> Result<Vec<LibrarySession>> {
         })?);
     }
     Ok(sessions)
+}
+
+pub fn inspect_library(library_dir: &Path) -> Result<LibraryInspect> {
+    let sessions = read_sessions(library_dir)?;
+    let mut projects = BTreeSet::new();
+    let mut source_buckets = BTreeSet::new();
+    let mut missing_transcript_records = 0;
+    let mut last_refresh: Option<DateTime<Utc>> = None;
+
+    for session in &sessions {
+        for project in [&session.cwd, &session.origin_cwd]
+            .into_iter()
+            .flatten()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            projects.insert(project.clone());
+        }
+
+        for source in &session.source_indexes {
+            source_buckets.insert((source.account_id.clone(), source.org_id.clone()));
+        }
+
+        let transcript_exists = match &session.transcript_path {
+            Some(path) => path
+                .try_exists()
+                .with_context(|| format!("failed to inspect transcript {}", path.display()))?,
+            None => false,
+        };
+        if !transcript_exists {
+            missing_transcript_records += 1;
+        }
+
+        last_refresh = Some(
+            last_refresh
+                .map(|current| current.max(session.updated_at))
+                .unwrap_or(session.updated_at),
+        );
+    }
+
+    Ok(LibraryInspect {
+        library_dir: library_dir.to_path_buf(),
+        sessions: sessions.len(),
+        projects: projects.len(),
+        source_buckets: source_buckets.len(),
+        missing_transcript_records,
+        last_refresh,
+    })
+}
+
+pub fn rebuild_library(
+    claude_dir: &Path,
+    desktop_dir: &Path,
+    library_dir: &Path,
+) -> Result<Vec<LibrarySession>> {
+    let path = sessions_path(library_dir);
+    if path
+        .try_exists()
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+    {
+        fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))?;
+    }
+
+    let buckets = list_desktop_buckets(desktop_dir)?;
+    let mut bucket_indexes = Vec::new();
+    for bucket in &buckets {
+        bucket_indexes.push((bucket.clone(), scan_desktop_indexes(&bucket.path)?));
+    }
+    let transcripts = scan_transcripts(claude_dir)?;
+
+    refresh_library(library_dir, &bucket_indexes, &transcripts)
 }
 
 fn session_from_index(
@@ -640,5 +720,125 @@ mod tests {
         let sessions = refresh_library(temp.path(), &indexes, &[]).unwrap();
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn inspect_library_counts_projects_sources_missing_transcripts_and_last_refresh() {
+        let temp = tempdir().unwrap();
+        let existing_transcript = temp.path().join("projects/session-a.jsonl");
+        let missing_transcript = temp.path().join("projects/session-b.jsonl");
+        fs::create_dir_all(existing_transcript.parent().unwrap()).unwrap();
+        fs::write(&existing_transcript, "{}\n").unwrap();
+        let older = DateTime::parse_from_rfc3339("2026-05-24T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let newer = DateTime::parse_from_rfc3339("2026-05-24T16:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sessions = vec![
+            LibrarySession {
+                cli_session_id: "session-a".to_string(),
+                transcript_path: Some(existing_transcript),
+                cwd: Some(PathBuf::from("/project/a")),
+                origin_cwd: Some(PathBuf::from("/project/a")),
+                title: None,
+                created_at_ms: None,
+                last_activity_at_ms: None,
+                last_focused_at_ms: None,
+                completed_turns: None,
+                source_indexes: vec![SourceIndex {
+                    account_id: "account-a".to_string(),
+                    org_id: "org-a".to_string(),
+                    path: temp.path().join("account-a/org-a/local_a.json"),
+                }],
+                raw_index_template: json!({}),
+                updated_at: older,
+            },
+            LibrarySession {
+                cli_session_id: "session-b".to_string(),
+                transcript_path: Some(missing_transcript),
+                cwd: Some(PathBuf::from("/project/b")),
+                origin_cwd: None,
+                title: None,
+                created_at_ms: None,
+                last_activity_at_ms: None,
+                last_focused_at_ms: None,
+                completed_turns: None,
+                source_indexes: vec![
+                    SourceIndex {
+                        account_id: "account-a".to_string(),
+                        org_id: "org-a".to_string(),
+                        path: temp.path().join("account-a/org-a/local_b.json"),
+                    },
+                    SourceIndex {
+                        account_id: "account-b".to_string(),
+                        org_id: "org-b".to_string(),
+                        path: temp.path().join("account-b/org-b/local_b.json"),
+                    },
+                ],
+                raw_index_template: json!({}),
+                updated_at: newer,
+            },
+            LibrarySession {
+                cli_session_id: "session-c".to_string(),
+                transcript_path: None,
+                cwd: None,
+                origin_cwd: Some(PathBuf::from("/project/c")),
+                title: None,
+                created_at_ms: None,
+                last_activity_at_ms: None,
+                last_focused_at_ms: None,
+                completed_turns: None,
+                source_indexes: Vec::new(),
+                raw_index_template: json!({}),
+                updated_at: older,
+            },
+        ];
+        write_sessions(temp.path(), &sessions).unwrap();
+
+        let inspect = inspect_library(temp.path()).unwrap();
+
+        assert_eq!(inspect.library_dir, temp.path());
+        assert_eq!(inspect.sessions, 3);
+        assert_eq!(inspect.projects, 3);
+        assert_eq!(inspect.source_buckets, 2);
+        assert_eq!(inspect.missing_transcript_records, 2);
+        assert_eq!(inspect.last_refresh, Some(newer));
+    }
+
+    #[test]
+    fn rebuild_library_recreates_sessions_jsonl_without_writing_desktop_bucket() {
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        let desktop_dir = temp.path().join("desktop");
+        let library_dir = temp.path().join("library");
+        let transcript_path = claude_dir.join("projects/-project/session-a.jsonl");
+        let bucket_path = desktop_dir.join("claude-code-sessions/account/org");
+        let index_path = bucket_path.join("local_a.json");
+        fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&bucket_path).unwrap();
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::write(&transcript_path, "{}\n").unwrap();
+        let index_text = json!({
+            "sessionId": "local_a",
+            "cliSessionId": "session-a",
+            "cwd": "/project",
+            "originCwd": "/project",
+            "title": "Session A",
+            "createdAt": 1000,
+            "lastActivityAt": 2000
+        })
+        .to_string();
+        fs::write(&index_path, &index_text).unwrap();
+        fs::write(sessions_path(&library_dir), "stale\n").unwrap();
+
+        let sessions = rebuild_library(&claude_dir, &desktop_dir, &library_dir).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cli_session_id, "session-a");
+        let rebuilt_text = fs::read_to_string(sessions_path(&library_dir)).unwrap();
+        assert!(rebuilt_text.contains("\"cliSessionId\":\"session-a\""));
+        assert!(!rebuilt_text.contains("stale"));
+        assert_eq!(fs::read_to_string(index_path).unwrap(), index_text);
     }
 }

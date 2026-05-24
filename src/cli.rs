@@ -1,3 +1,4 @@
+use crate::library::{inspect_library, rebuild_library};
 use crate::paths::{default_claude_dir, default_desktop_dir, default_relink_dir, library_dir};
 use crate::restore::{restore_backup, restore_latest};
 use crate::sync::{apply_sync_plan, build_sync_plan, SyncFilters};
@@ -88,7 +89,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sync(command) => sync(command),
         Command::Restore(command) => restore(command),
-        Command::Library(_) => Ok(()),
+        Command::Library(command) => library(command),
     }
 }
 
@@ -129,6 +130,26 @@ fn restore(command: RestoreCommand) -> Result<()> {
     };
 
     print!("{}", crate::report::restore_summary(&summary));
+    Ok(())
+}
+
+fn library(command: LibraryCommand) -> Result<()> {
+    let relink_dir = command.paths.relink_dir.unwrap_or(default_relink_dir()?);
+    let library_dir = library_dir(&relink_dir);
+
+    match command.action {
+        LibraryAction::Inspect => {
+            let inspect = inspect_library(&library_dir)?;
+            print!("{}", crate::report::library_inspect(&inspect));
+        }
+        LibraryAction::Rebuild => {
+            let claude_dir = command.paths.claude_dir.unwrap_or(default_claude_dir()?);
+            let desktop_dir = command.paths.desktop_dir.unwrap_or(default_desktop_dir()?);
+            let sessions = rebuild_library(&claude_dir, &desktop_dir, &library_dir)?;
+            print!("{}", crate::report::library_rebuild(&sessions));
+        }
+    }
+
     Ok(())
 }
 

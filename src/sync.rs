@@ -28,6 +28,7 @@ pub struct SyncPlan {
     pub already_visible: Vec<DesktopIndex>,
     pub missing: Vec<LibrarySession>,
     pub skipped_missing_transcript: Vec<LibrarySession>,
+    pub skipped_unsupported_desktop_metadata: Vec<LibrarySession>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ pub fn build_sync_plan(
 
     let mut missing = Vec::new();
     let mut skipped_missing_transcript = Vec::new();
+    let mut skipped_unsupported_desktop_metadata = Vec::new();
     for session in filtered_sessions {
         let transcript_exists = match &session.transcript_path {
             Some(path) => path
@@ -95,6 +97,11 @@ pub fn build_sync_plan(
         };
         if !transcript_exists {
             skipped_missing_transcript.push(session.clone());
+            continue;
+        }
+
+        if !has_supported_desktop_metadata(session) {
+            skipped_unsupported_desktop_metadata.push(session.clone());
             continue;
         }
 
@@ -109,6 +116,7 @@ pub fn build_sync_plan(
         already_visible,
         missing,
         skipped_missing_transcript,
+        skipped_unsupported_desktop_metadata,
     })
 }
 
@@ -336,6 +344,22 @@ fn matches_source_filters(session: &LibrarySession, filters: &SyncFilters) -> bo
                 .as_deref()
                 .is_none_or(|org| source.org_id == org)
     })
+}
+
+fn has_supported_desktop_metadata(session: &LibrarySession) -> bool {
+    if session.source_indexes.is_empty() {
+        return false;
+    }
+
+    let has_project = !session.cwd_string().trim().is_empty();
+    let has_title = session
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .is_some();
+
+    has_project && has_title
 }
 
 #[cfg(test)]
@@ -573,6 +597,42 @@ mod tests {
     }
 
     #[test]
+    fn transcript_only_sessions_are_skipped_as_unsupported_for_desktop_sync() {
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        let desktop_dir = temp.path().join("desktop");
+        let library_dir = temp.path().join("library");
+        let old_bucket = create_bucket(&desktop_dir, "old", "org");
+        create_bucket(&desktop_dir, "current", "org");
+        write_owner(&desktop_dir);
+        write_transcript(&claude_dir, "with-index");
+        write_transcript(&claude_dir, "transcript-only");
+        write_index(
+            &old_bucket,
+            "local_with_index",
+            "with-index",
+            "/Users/demo/project",
+            "/Users/demo/project",
+        );
+
+        let plan = build_sync_plan(
+            &claude_dir,
+            &desktop_dir,
+            &library_dir,
+            None,
+            None,
+            SyncFilters::default(),
+        )
+        .unwrap();
+
+        assert_eq!(session_ids(&plan.missing), vec!["with-index"]);
+        assert_eq!(
+            session_ids(&plan.skipped_unsupported_desktop_metadata),
+            vec!["transcript-only"]
+        );
+    }
+
+    #[test]
     fn source_filters_do_not_narrow_library_refresh_sources() {
         let temp = tempdir().unwrap();
         let claude_dir = temp.path().join(".claude");
@@ -731,6 +791,7 @@ mod tests {
             already_visible: Vec::new(),
             missing: vec![session],
             skipped_missing_transcript: Vec::new(),
+            skipped_unsupported_desktop_metadata: Vec::new(),
         };
 
         let summary = apply_sync_plan(&plan, &relink_dir, true).unwrap();

@@ -48,6 +48,9 @@ pub fn scan_desktop_indexes(bucket: &Path) -> Result<Vec<DesktopIndex>> {
             Ok(raw) => raw,
             Err(_) => continue,
         };
+        if is_generated_recovered_placeholder(&raw) {
+            continue;
+        }
         let session_id = raw
             .get("sessionId")
             .and_then(Value::as_str)
@@ -72,6 +75,26 @@ pub fn scan_desktop_indexes(bucket: &Path) -> Result<Vec<DesktopIndex>> {
 
     indexes.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     Ok(indexes)
+}
+
+fn is_generated_recovered_placeholder(raw: &Value) -> bool {
+    let title = raw
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let cwd = raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let origin_cwd = raw
+        .get("originCwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+
+    title.starts_with("Recovered ") && cwd.is_empty() && origin_cwd.is_empty()
 }
 
 fn file_stem(path: &Path) -> String {
@@ -191,6 +214,26 @@ mod tests {
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].session_id, "local_valid");
         assert_eq!(indexes[0].cli_session_id.as_deref(), Some("cli-valid"));
+    }
+
+    #[test]
+    fn scan_desktop_indexes_skips_generated_recovered_placeholders() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("local_placeholder.json"),
+            r#"{"sessionId":"local_placeholder","cliSessionId":"agent-a2","cwd":"","originCwd":"","title":"Recovered agent-a2","titleSource":"auto","createdAt":0,"lastActivityAt":0,"lastFocusedAt":0}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("local_valid.json"),
+            r#"{"sessionId":"local_valid","cliSessionId":"cli-valid","cwd":"/tmp/project","originCwd":"/tmp/project","title":"Valid"}"#,
+        )
+        .unwrap();
+
+        let indexes = scan_desktop_indexes(temp.path()).unwrap();
+
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].session_id, "local_valid");
     }
 
     #[test]

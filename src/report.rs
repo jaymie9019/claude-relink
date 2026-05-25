@@ -12,6 +12,7 @@ Library sessions: {}
 Already visible in current account: {}
 Missing in current account: {}
 Skipped because transcript is missing: {}
+Skipped because Desktop metadata is incomplete: {}
 
 Next:
   Quit Claude Desktop
@@ -22,6 +23,7 @@ Next:
         plan.already_visible.len(),
         plan.missing.len(),
         plan.skipped_missing_transcript.len(),
+        plan.skipped_unsupported_desktop_metadata.len(),
     )
 }
 

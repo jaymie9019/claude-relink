@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -188,6 +190,89 @@ fn sync_apply_writes_missing_session_with_backup_manifest() {
         created_file.file_name().unwrap().to_string_lossy().as_ref()
     );
     assert!(manifest["skippedExisting"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_apply_ignores_stale_claude_helper_processes() {
+    let temp = tempdir().unwrap();
+    let claude_dir = temp.path().join(".claude");
+    let desktop_dir = temp.path().join("Library/Application Support/Claude");
+    let relink_dir = temp.path().join(".claude-relink");
+    seed_sync_apply_fixture(&claude_dir, &desktop_dir);
+    let path = fake_pgrep_path(
+        temp.path(),
+        r#"#!/bin/sh
+if [ "$1" = "-x" ] && [ "$2" = "Claude" ]; then
+  exit 1
+fi
+if [ "$1" = "-f" ] && [ "$2" = "Claude.app" ]; then
+  printf '%s\n' '27360 /Applications/Claude.app/Contents/Helpers/chrome-native-host chrome-extension://example/'
+  printf '%s\n' '80604 /Applications/Claude.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler --database=/Users/demo/Library/Application Support/Claude/Crashpad'
+  exit 0
+fi
+exit 2
+"#,
+    );
+
+    Command::cargo_bin("claude-relink")
+        .unwrap()
+        .env("PATH", path)
+        .args([
+            "sync",
+            "--apply",
+            "--claude-dir",
+            claude_dir.to_str().unwrap(),
+            "--desktop-dir",
+            desktop_dir.to_str().unwrap(),
+            "--relink-dir",
+            relink_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created files: 1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_apply_blocks_when_claude_main_process_is_running() {
+    let temp = tempdir().unwrap();
+    let claude_dir = temp.path().join(".claude");
+    let desktop_dir = temp.path().join("Library/Application Support/Claude");
+    let relink_dir = temp.path().join(".claude-relink");
+    seed_sync_apply_fixture(&claude_dir, &desktop_dir);
+    let path = fake_pgrep_path(
+        temp.path(),
+        r#"#!/bin/sh
+if [ "$1" = "-x" ] && [ "$2" = "Claude" ]; then
+  printf '%s\n' '99496 Claude'
+  exit 0
+fi
+if [ "$1" = "-f" ] && [ "$2" = "Claude.app" ]; then
+  exit 1
+fi
+exit 2
+"#,
+    );
+
+    Command::cargo_bin("claude-relink")
+        .unwrap()
+        .env("PATH", path)
+        .args([
+            "sync",
+            "--apply",
+            "--claude-dir",
+            claude_dir.to_str().unwrap(),
+            "--desktop-dir",
+            desktop_dir.to_str().unwrap(),
+            "--relink-dir",
+            relink_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Claude Desktop appears to be running",
+        ));
 }
 
 #[test]
@@ -435,4 +520,18 @@ fn count_local_indexes(bucket: &Path) -> usize {
             name.starts_with("local_") && name.ends_with(".json")
         })
         .count()
+}
+
+#[cfg(unix)]
+fn fake_pgrep_path(temp: &Path, script: &str) -> String {
+    let bin_dir = temp.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let pgrep = bin_dir.join("pgrep");
+    fs::write(&pgrep, script).unwrap();
+    let mut permissions = fs::metadata(&pgrep).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&pgrep, permissions).unwrap();
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    format!("{}:{}", bin_dir.display(), existing_path.to_string_lossy())
 }

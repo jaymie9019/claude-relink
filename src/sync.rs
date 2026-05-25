@@ -347,10 +347,6 @@ fn matches_source_filters(session: &LibrarySession, filters: &SyncFilters) -> bo
 }
 
 fn has_supported_desktop_metadata(session: &LibrarySession) -> bool {
-    if session.source_indexes.is_empty() {
-        return false;
-    }
-
     let has_project = !session.cwd_string().trim().is_empty();
     let has_title = session
         .title
@@ -358,6 +354,13 @@ fn has_supported_desktop_metadata(session: &LibrarySession) -> bool {
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .is_some();
+    let has_activity = session.created_at_ms.is_some()
+        || session.last_activity_at_ms.is_some()
+        || session.last_focused_at_ms.is_some();
+
+    if session.source_indexes.is_empty() {
+        return has_project && has_title && has_activity;
+    }
 
     has_project && has_title
 }
@@ -391,6 +394,21 @@ mod tests {
         let project = claude_dir.join("projects/-Users-demo-project");
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join(format!("{cli_session_id}.jsonl")), "{}\n").unwrap();
+    }
+
+    fn write_transcript_with_metadata(claude_dir: &Path, cli_session_id: &str, cwd: &Path) {
+        let project = claude_dir.join("projects/-Users-demo-project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(format!("{cli_session_id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"timestamp\":\"1970-01-01T00:00:01.000Z\",\"message\":{{\"content\":\"first prompt\"}}}}\n{{\"type\":\"last-prompt\",\"lastPrompt\":\"Recovered from transcript\",\"sessionId\":\"{}\"}}\n{{\"type\":\"assistant\",\"cwd\":\"{}\",\"timestamp\":\"1970-01-01T00:00:02.000Z\"}}\n",
+                cwd.display(),
+                cli_session_id,
+                cwd.display()
+            ),
+        )
+        .unwrap();
     }
 
     fn write_index(
@@ -630,6 +648,36 @@ mod tests {
             session_ids(&plan.skipped_unsupported_desktop_metadata),
             vec!["transcript-only"]
         );
+    }
+
+    #[test]
+    fn transcript_only_sessions_with_project_metadata_are_syncable() {
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        let desktop_dir = temp.path().join("desktop");
+        let library_dir = temp.path().join("library");
+        create_bucket(&desktop_dir, "current", "org");
+        write_owner(&desktop_dir);
+        let project_dir = temp.path().join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_transcript_with_metadata(&claude_dir, "transcript-only", &project_dir);
+
+        let plan = build_sync_plan(
+            &claude_dir,
+            &desktop_dir,
+            &library_dir,
+            None,
+            None,
+            SyncFilters {
+                project: Some(project_dir.clone()),
+                from_account: None,
+                from_org: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session_ids(&plan.missing), vec!["transcript-only"]);
+        assert!(plan.skipped_unsupported_desktop_metadata.is_empty());
     }
 
     #[test]

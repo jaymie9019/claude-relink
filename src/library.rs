@@ -89,7 +89,7 @@ pub fn refresh_library(
     let now = Utc::now();
     let transcript_by_id: BTreeMap<_, _> = transcripts
         .iter()
-        .map(|transcript| (transcript.cli_session_id.clone(), transcript.path.clone()))
+        .map(|transcript| (transcript.cli_session_id.clone(), transcript))
         .collect();
     let mut by_id: BTreeMap<String, LibrarySession> = BTreeMap::new();
     let mut title_activity_by_id: BTreeMap<String, i64> = BTreeMap::new();
@@ -104,7 +104,9 @@ pub fn refresh_library(
 
             let candidate = session_from_index(
                 cli_session_id.clone(),
-                transcript_by_id.get(&cli_session_id).cloned(),
+                transcript_by_id
+                    .get(&cli_session_id)
+                    .map(|transcript| transcript.path.clone()),
                 index,
                 now,
             );
@@ -124,7 +126,9 @@ pub fn refresh_library(
                 }
             }
             if entry.transcript_path.is_none() {
-                entry.transcript_path = transcript_by_id.get(&entry.cli_session_id).cloned();
+                entry.transcript_path = transcript_by_id
+                    .get(&entry.cli_session_id)
+                    .map(|transcript| transcript.path.clone());
             }
             entry.source_indexes.push(SourceIndex {
                 account_id: bucket.account_id.clone(),
@@ -139,25 +143,11 @@ pub fn refresh_library(
         by_id
             .entry(transcript.cli_session_id.clone())
             .and_modify(|session| {
-                if session.transcript_path.is_none() {
-                    session.transcript_path = Some(transcript.path.clone());
+                if update_session_from_transcript(session, transcript) {
                     session.updated_at = now;
                 }
             })
-            .or_insert_with(|| LibrarySession {
-                cli_session_id: transcript.cli_session_id.clone(),
-                transcript_path: Some(transcript.path.clone()),
-                cwd: None,
-                origin_cwd: None,
-                title: None,
-                created_at_ms: None,
-                last_activity_at_ms: None,
-                last_focused_at_ms: None,
-                completed_turns: None,
-                source_indexes: Vec::new(),
-                raw_index_template: Value::Object(Default::default()),
-                updated_at: now,
-            });
+            .or_insert_with(|| session_from_transcript(transcript, now));
     }
 
     let sessions: Vec<_> = by_id.into_values().collect();
@@ -305,6 +295,72 @@ fn session_from_index(
     }
 }
 
+fn session_from_transcript(
+    transcript: &TranscriptRef,
+    updated_at: DateTime<Utc>,
+) -> LibrarySession {
+    LibrarySession {
+        cli_session_id: transcript.cli_session_id.clone(),
+        transcript_path: Some(transcript.path.clone()),
+        cwd: transcript.cwd.clone(),
+        origin_cwd: transcript.cwd.clone(),
+        title: transcript_title_or_fallback(transcript),
+        created_at_ms: transcript.created_at_ms,
+        last_activity_at_ms: transcript.last_activity_at_ms,
+        last_focused_at_ms: transcript.last_activity_at_ms,
+        completed_turns: None,
+        source_indexes: Vec::new(),
+        raw_index_template: Value::Object(Default::default()),
+        updated_at,
+    }
+}
+
+fn update_session_from_transcript(
+    session: &mut LibrarySession,
+    transcript: &TranscriptRef,
+) -> bool {
+    let mut changed = false;
+
+    if session.transcript_path.is_none() {
+        session.transcript_path = Some(transcript.path.clone());
+        changed = true;
+    }
+    if session.cwd.is_none() && transcript.cwd.is_some() {
+        session.cwd = transcript.cwd.clone();
+        changed = true;
+    }
+    if session.origin_cwd.is_none() && transcript.cwd.is_some() {
+        session.origin_cwd = transcript.cwd.clone();
+        changed = true;
+    }
+    if session
+        .title
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        if let Some(title) = transcript_title_or_fallback(transcript) {
+            session.title = Some(title);
+            changed = true;
+        }
+    }
+    if session.created_at_ms.is_none() && transcript.created_at_ms.is_some() {
+        session.created_at_ms = transcript.created_at_ms;
+        changed = true;
+    }
+    if session.last_activity_at_ms.is_none() && transcript.last_activity_at_ms.is_some() {
+        session.last_activity_at_ms = transcript.last_activity_at_ms;
+        changed = true;
+    }
+    if session.last_focused_at_ms.is_none() && transcript.last_activity_at_ms.is_some() {
+        session.last_focused_at_ms = transcript.last_activity_at_ms;
+        changed = true;
+    }
+
+    changed
+}
+
 fn update_session_from_index(session: &mut LibrarySession, index: &DesktopIndex) {
     session.cwd = index.cwd.clone();
     session.origin_cwd = index.origin_cwd.clone();
@@ -317,6 +373,30 @@ fn update_session_from_index(session: &mut LibrarySession, index: &DesktopIndex)
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
     session.raw_index_template = index.raw.clone();
+}
+
+fn transcript_title_or_fallback(transcript: &TranscriptRef) -> Option<String> {
+    transcript
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| title_from_transcript_cwd(transcript))
+}
+
+fn title_from_transcript_cwd(transcript: &TranscriptRef) -> Option<String> {
+    let project = transcript
+        .cwd
+        .as_ref()?
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())?;
+    let prefix = transcript
+        .cli_session_id
+        .chars()
+        .take(8)
+        .collect::<String>();
+    Some(format!("{project} {prefix}"))
 }
 
 fn session_activity_key(session: &LibrarySession) -> i64 {
@@ -444,6 +524,10 @@ mod tests {
         let transcripts = vec![TranscriptRef {
             cli_session_id: "session-1".to_string(),
             path: transcript_path.clone(),
+            cwd: None,
+            created_at_ms: None,
+            last_activity_at_ms: None,
+            title: None,
         }];
 
         let sessions = refresh_library(temp.path(), &indexes, &transcripts).unwrap();
@@ -468,6 +552,10 @@ mod tests {
         let transcripts = vec![TranscriptRef {
             cli_session_id: "session-transcript-only".to_string(),
             path: transcript_path.clone(),
+            cwd: None,
+            created_at_ms: None,
+            last_activity_at_ms: None,
+            title: None,
         }];
 
         let sessions = refresh_library(temp.path(), &[], &transcripts).unwrap();
